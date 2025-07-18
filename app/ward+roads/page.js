@@ -1,10 +1,10 @@
 'use client';
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import Map from 'ol/Map';
 import View from 'ol/View';
 import { Tile as TileLayer, Vector as VectorLayer } from 'ol/layer';
-import { OSM } from 'ol/source';
+import { OSM, XYZ } from 'ol/source';
 import { Vector as VectorSource } from 'ol/source';
 import { WKT } from 'ol/format';
 import { Style, Stroke, Fill, Circle as CircleStyle } from 'ol/style';
@@ -12,455 +12,346 @@ import { Draw } from 'ol/interaction';
 import { getLength, getArea } from 'ol/sphere';
 import Overlay from 'ol/Overlay';
 import 'ol/ol.css';
-import * as XLSX from 'xlsx';
+import { utils, writeFile } from 'xlsx';
+// Note: You'll need to install recharts for the data visualization
+// npm install recharts
+import { PieChart, Pie, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, Cell, ResponsiveContainer } from 'recharts';
 
-
-const colorMap = {
-  Good: 'green',
-  Moderate: 'orange',
-  Poor: 'red'
+// --- Configuration ---
+const colorMap = { Good: '#28a745', Moderate: '#ffc107', Poor: '#dc3545' };
+const baseMaps = {
+  OSM: new OSM(),
+  Satellite: new XYZ({ url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}' }),
+  Dark: new XYZ({ url: 'https://{a-c}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png' }),
+  Light: new XYZ({ url: 'https://{a-c}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png' }),
+  Topo: new XYZ({ url: 'https://{a-c}.tile.opentopomap.org/{z}/{x}/{y}.png' }),
 };
+const SOURCE_PROJECTION = 'EPSG:32644';
+const MAP_PROJECTION = 'EPSG:4326';
 
-const carriageColorMap = {
-  'Single Carriageway': '#3498db',
-  'Double Carriageway': '#9b59b6',
-  'Mixed': '#2ecc71'
-};
-
-
+// --- Main Component ---
 const AllRoadsPage = () => {
-  const mapRef = useRef(null);
-  const mapInstanceRef = useRef(null);
-  const tooltipRef = useRef(null);
-  const [wardData, setWardData] = useState([]);
-  const [roadData, setRoadData] = useState([]);
-  const [multiWardRoads, setMultiWardRoads] = useState([]);
-  const [selectedWard, setSelectedWard] = useState(null);
-  const [selectedRoads, setSelectedRoads] = useState([]);
-  const [showWards, setShowWards] = useState(true);
-  const [showRoads, setShowRoads] = useState(true);
-  const [showMultiWardRoads, setShowMultiWardRoads] = useState(true);
-  const [conditionFilter, setConditionFilter] = useState(['Good', 'Moderate', 'Poor']);
-  const [onlySelected, setOnlySelected] = useState(false);
-  const [measureMode, setMeasureMode] = useState(null);
-  const [carriageTypes, setCarriageTypes] = useState([]);
-const [selectedCarriage, setSelectedCarriage] = useState('');
+    // --- State Management ---
+    const [wardData, setWardData] = useState([]);
+    const [roadData, setRoadData] = useState([]);
+    const [multiWardRoads, setMultiWardRoads] = useState([]);
+    const [carriageTypes, setCarriageTypes] = useState([]);
 
+    // UI & Filter State
+    const [selectedRoads, setSelectedRoads] = useState([]);
+    const [showWards, setShowWards] = useState(true);
+    const [showRoads, setShowRoads] = useState(true);
+    const [showMultiWardRoads, setShowMultiWardRoads] = useState(true);
+    const [conditionFilter, setConditionFilter] = useState(['Good', 'Moderate', 'Poor']);
+    const [selectedCarriage, setSelectedCarriage] = useState('');
+    const [measureMode, setMeasureMode] = useState(null);
+    const [baseMapType, setBaseMapType] = useState('OSM');
 
-  useEffect(() => {
-    const fetchWards = async () => {
-      const res = await fetch('http://localhost:8080/api/ward/all');
-      setWardData(await res.json());
-    };
+    // Map & Layer Refs
+    const mapRef = useRef(null);
+    const popupRef = useRef(null);
+    const tooltipRef = useRef(null);
+    const mapInstanceRef = useRef(null);
+    const wardLayerRef = useRef(null);
+    const roadLayerRef = useRef(null);
+    const measureLayerRef = useRef(null);
+    const popupOverlayRef = useRef(null);
 
-    const fetchRoads = async () => {
-     const res = await fetch('http://localhost:8080/api/road/all');
-const data = await res.json();
-setRoadData(data);
-
-const types = [...new Set(data.map(r => r.carriageM).filter(Boolean))];
-setCarriageTypes(types);
-
-    };
-
-    const fetchMultiWardRoads = async () => {
-      const res = await fetch('http://localhost:8080/api/road/multi-ward-roads');
-      setMultiWardRoads(await res.json());
-    };
-
-    fetchWards();
-    fetchRoads();
-    fetchMultiWardRoads();
-  }, []);
-
-  useEffect(() => {
-    if (!mapRef.current || wardData.length === 0) return;
-    if (mapInstanceRef.current) mapInstanceRef.current.setTarget(null);
-
-    const baseLayer = new TileLayer({ source: new OSM() });
-    const wktFormat = new WKT();
-    const wardSource = new VectorSource();
-    const roadSource = new VectorSource();
-    const measureSource = new VectorSource();
-
-    // Wards
-    wardData.forEach((ward) => {
-      const show = onlySelected ? selectedWard?.gid === ward.gid : showWards;
-      if (!ward.wkt || !show) return;
-      try {
-        const feature = wktFormat.readFeature(ward.wkt.replace(/^"+|"+$/g, ''), {
-          dataProjection: 'EPSG:4326',
-          featureProjection: 'EPSG:4326'
+    // --- Data Fetching ---
+    useEffect(() => {
+        const fetchData = async (url, setter, postProcess) => {
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+                setter(data);
+                if (postProcess) postProcess(data);
+            } catch (err) { console.error(`Failed to fetch from ${url}:`, err); }
+        };
+        fetchData('http://localhost:8080/api/ward/all', setWardData);
+        fetchData('http://localhost:8080/api/road/all', setRoadData, (data) => {
+            setCarriageTypes([...new Set(data.map(r => r.carriageM).filter(Boolean))]);
         });
-        feature.setProperties({ ...ward, type: 'ward' });
-        feature.setStyle(new Style({
-          stroke: new Stroke({ color: '#003366', width: selectedWard?.gid === ward.gid ? 6 : 3 }),
-          fill: new Fill({ color: 'rgba(0,0,0,0.05)' })
-        }));
-        wardSource.addFeature(feature);
-      } catch (err) {
-        console.error('Ward parse error:', ward.wardNo);
-      }
-    });
+        fetchData('http://localhost:8080/api/road/multi-ward-roads', setMultiWardRoads);
+    }, []);
 
-    // Normal Roads
-    roadData.forEach((road) => {
-      const matchCondition = conditionFilter.includes(road.condition);
-const matchCarriage = selectedCarriage === '' || road.carriageM === selectedCarriage;
-const show = onlySelected
-  ? selectedRoads.some(r => r.gid === road.gid)
-  : showRoads && matchCondition && matchCarriage;
+    // --- Map Initialization & Event Handling ---
+    useEffect(() => {
+        if (!mapRef.current) return;
 
-      if (!road.wkt || !show) return;
-      try {
-        const feature = wktFormat.readFeature(road.wkt.replace(/^"+|"+$/g, ''), {
-          dataProjection: 'EPSG:32644',
-          featureProjection: 'EPSG:4326'
-        });
-        feature.setProperties({ ...road, type: 'road' });
-        feature.setStyle(new Style({
-          stroke: new Stroke({
-            color: colorMap[road.condition] || 'gray',
-            width: selectedRoads.some(r => r.gid === road.gid) ? 5 : 2
-          })
-        }));
-        roadSource.addFeature(feature);
-      } catch (err) {
-        console.error('Road parse error:', road.roadName);
-      }
-    });
+        if (!mapInstanceRef.current) {
+            wardLayerRef.current = new VectorLayer({ source: new VectorSource(), zIndex: 1 });
+            roadLayerRef.current = new VectorLayer({ source: new VectorSource(), zIndex: 2 });
+            measureLayerRef.current = new VectorLayer({ source: new VectorSource(), zIndex: 3 });
 
-    // Multi-Ward Roads
-    if (showMultiWardRoads) {
-      multiWardRoads.forEach((road) => {
-        const matchCondition = conditionFilter.includes(road.condition);
-        if (!road.wkt || !matchCondition) return;
-        try {
-          const feature = wktFormat.readFeature(road.wkt.replace(/^"+|"+$/g, ''), {
-            dataProjection: 'EPSG:32644',
-            featureProjection: 'EPSG:4326'
-          });
-          feature.setProperties({ ...road, type: 'multi-road' });
-          feature.setStyle(new Style({
-            stroke: new Stroke({
-color: selectedCarriage
-  ? carriageColorMap[road.carriageM] || 'gray'
-  : colorMap[road.condition] || 'gray',
-              width: 6
-            })
-          }));
-          roadSource.addFeature(feature);
-        } catch (err) {
-          console.error('Multi-ward road parse error:', road.roadName);
+            popupOverlayRef.current = new Overlay({
+                element: popupRef.current,
+                autoPan: { animation: { duration: 250 } },
+            });
+
+            const tooltipOverlay = new Overlay({
+                element: tooltipRef.current,
+                offset: [15, 0],
+                positioning: 'center-left',
+            });
+
+            mapInstanceRef.current = new Map({
+                target: mapRef.current,
+                layers: [new TileLayer({ source: baseMaps[baseMapType] }), wardLayerRef.current, roadLayerRef.current, measureLayerRef.current],
+                overlays: [popupOverlayRef.current, tooltipOverlay],
+                view: new View({ center: [77.45, 28.7], zoom: 12, projection: MAP_PROJECTION }),
+                controls: [],
+            });
+
+            mapInstanceRef.current.on('pointermove', (e) => {
+                if (e.dragging) {
+                    tooltipRef.current.style.display = 'none';
+                    return;
+                }
+                const feature = mapInstanceRef.current.forEachFeatureAtPixel(e.pixel, f => f, { hitTolerance: 5 });
+                const isRoad = feature && (feature.get('type') === 'road' || feature.get('type') === 'multi-road');
+
+                tooltipRef.current.style.display = isRoad ? '' : 'none';
+                if (isRoad) {
+                    const props = feature.getProperties();
+                    tooltipRef.current.innerHTML = `<b>${props.roadName}</b>`;
+                    tooltipOverlay.setPosition(e.coordinate);
+                }
+            });
         }
-      });
-    }
 
-    const map = new Map({
-      target: mapRef.current,
-      layers: [
-        baseLayer,
-        new VectorLayer({ source: wardSource }),
-        new VectorLayer({ source: roadSource }),
-        new VectorLayer({ source: measureSource })
-      ],
-      view: new View({
-        center: [77.45, 28.7],
-        zoom: 12,
-        projection: 'EPSG:4326'
-      })
-    });
+        const map = mapInstanceRef.current;
+        const clickHandler = (e) => {
+            if (measureMode) return;
+            const feature = map.forEachFeatureAtPixel(e.pixel, f => f, { hitTolerance: 10 });
 
-    mapInstanceRef.current = map;
+            if (feature && (feature.get('type') === 'road' || feature.get('type') === 'multi-road')) {
+                const props = feature.getProperties();
+                const isSelected = selectedRoads.some(r => r.gid === props.gid);
 
-    // Tooltip overlay
-    const tooltip = document.createElement('div');
-    tooltip.className = 'absolute bg-white text-black text-xs px-2 py-1 border rounded shadow z-50';
-    tooltip.style.pointerEvents = 'none';
-    tooltip.style.display = 'none';
-    tooltipRef.current = new Overlay({ element: tooltip, offset: [10, 0], positioning: 'bottom-left' });
-    map.addOverlay(tooltipRef.current);
-    mapRef.current.appendChild(tooltip);
+                setSelectedRoads(prev => isSelected ? prev.filter(r => r.gid !== props.gid) : [...prev, props]);
 
-    map.on('pointermove', (e) => {
-      const feature = map.forEachFeatureAtPixel(e.pixel, f => f);
-      if (feature && ['road', 'multi-road'].includes(feature.get('type'))) {
+                if (!isSelected) {
+                    const content = `
+                        <div class="font-bold text-black">${props.roadName}</div>
+                        <div class="text-sm text-black">Condition: ${props.condition}</div>
+                    `;
+                    popupRef.current.innerHTML = content;
+                    popupOverlayRef.current.setPosition(e.coordinate);
+                } else {
+                    popupOverlayRef.current.setPosition(undefined);
+                }
+            }
+        };
+
+        map.on('singleclick', clickHandler);
+        return () => map.un('singleclick', clickHandler);
+
+    }, [measureMode, selectedRoads]);
+
+    useEffect(() => {
+        if (!mapInstanceRef.current) return;
+        mapInstanceRef.current.getLayers().getArray()[0].setSource(baseMaps[baseMapType]);
+    }, [baseMapType]);
+
+    const visibleFeatures = useMemo(() => {
+        const wkt = new WKT();
+        const createFeature = (item, type, sourceProj) => {
+            try {
+                if(!item.wkt) return null;
+                const feature = wkt.readFeature(item.wkt.replace(/^"+|"+$/g, ''), {
+                    dataProjection: sourceProj, featureProjection: MAP_PROJECTION
+                });
+                feature.setProperties({ ...item, type });
+                feature.setId(item.gid);
+                return feature;
+            } catch { return null; }
+        };
+
+        const wards = !showWards ? [] : wardData.map(w => createFeature(w, 'ward', 'EPSG:4326'));
+        const roads = !showRoads ? [] : roadData.filter(r => conditionFilter.includes(r.condition) && (selectedCarriage === '' || r.carriageM === selectedCarriage)).map(r => createFeature(r, 'road', 'EPSG:4326'));
+        const multiWards = !showMultiWardRoads ? [] : multiWardRoads.filter(r => conditionFilter.includes(r.condition) && (selectedCarriage === '' || r.carriageM === selectedCarriage)).map(r => createFeature(r, 'multi-road', SOURCE_PROJECTION));
+            
+        return { wards: wards.filter(Boolean), roads: [...roads, ...multiWards].filter(Boolean) };
+    }, [wardData, roadData, multiWardRoads, showWards, showRoads, showMultiWardRoads, conditionFilter, selectedCarriage]);
+
+    const styleFunction = useCallback((feature) => {
         const props = feature.getProperties();
-        tooltip.innerHTML = `<b>${props.roadName}</b><br/>Condition: ${props.condition}`;
-        tooltip.style.display = 'block';
-        tooltipRef.current.setPosition(e.coordinate);
-      } else {
-        tooltip.style.display = 'none';
-      }
-    });
-
-    map.on('singleclick', (evt) => {
-      const feature = map.forEachFeatureAtPixel(evt.pixel, (f) => f);
-      if (!feature) return;
-      const props = feature.getProperties();
-      if (props.type === 'ward') {
-        setSelectedWard(props);
-      } else if (['road', 'multi-road'].includes(props.type)) {
-        setSelectedRoads((prev) => {
-          const exists = prev.find(r => r.gid === props.gid);
-          return exists ? prev.filter(r => r.gid !== props.gid) : [...prev, props];
-        });
-      }
-    });
-
-    if (measureMode) {
-      const draw = new Draw({
-        source: measureSource,
-        type: measureMode,
-        style: new Style({
-          stroke: new Stroke({ color: '#000', width: 2 }),
-          fill: new Fill({ color: 'rgba(0, 0, 255, 0.1)' }),
-          image: new CircleStyle({ radius: 5, fill: new Fill({ color: '#000' }) })
-        })
-      });
-
-      draw.on('drawend', (e) => {
-        const geom = e.feature.getGeometry().clone().transform('EPSG:4326', 'EPSG:3857');
-        if (measureMode === 'LineString') {
-          alert(`Length: ${(getLength(geom) / 1000).toFixed(2)} km`);
-        } else if (measureMode === 'Polygon') {
-          alert(`Area: ${(getArea(geom) / 10000).toFixed(2)} hectares`);
+        if (props.type === 'ward') {
+            return new Style({
+                stroke: new Stroke({ color: '#003366', width: 3 }),
+                fill: new Fill({ color: 'rgba(0,0,0,0.05)' })
+            });
         }
-        setMeasureMode(null);
-        map.removeInteraction(draw);
-      });
+        if (['road', 'multi-road'].includes(props.type)) {
+            const isSelected = selectedRoads.some(r => r.gid === props.gid);
+            let color = isSelected ? '#0d6efd' : (colorMap[props.condition] || 'gray');
+            return new Style({
+                stroke: new Stroke({ color, width: isSelected ? 6 : (props.type === 'multi-road' ? 4 : 2) })
+            });
+        }
+    }, [selectedRoads]);
 
-      map.addInteraction(draw);
-    }
- }, [wardData, roadData, multiWardRoads, showWards, showRoads, showMultiWardRoads, conditionFilter, selectedWard?.gid, selectedRoads, onlySelected, measureMode, selectedCarriage]);
+    useEffect(() => {
+        wardLayerRef.current?.getSource().clear();
+        wardLayerRef.current?.getSource().addFeatures(visibleFeatures.wards);
+        wardLayerRef.current?.setStyle(styleFunction);
 
-const handleExportToExcel = () => {
-  const visibleRoads = [];
+        roadLayerRef.current?.getSource().clear();
+        roadLayerRef.current?.getSource().addFeatures(visibleFeatures.roads);
+        roadLayerRef.current?.setStyle(styleFunction);
+    }, [visibleFeatures, styleFunction]);
+    
+    useEffect(() => {
+        if (!mapInstanceRef.current) return;
+        mapInstanceRef.current.getInteractions().getArray().filter(i => i instanceof Draw).forEach(i => mapInstanceRef.current.removeInteraction(i));
+        measureLayerRef.current.getSource().clear();
 
-  // Normal Roads
-  roadData.forEach((road) => {
-    const matchCondition = conditionFilter.includes(road.condition);
-    const matchCarriage = selectedCarriage === '' || road.carriageM === selectedCarriage;
-    const isVisible = onlySelected
-      ? selectedRoads.some((r) => r.gid === road.gid)
-      : showRoads && matchCondition && matchCarriage;
+        if (measureMode) {
+            const draw = new Draw({
+                source: measureLayerRef.current.getSource(), type: measureMode,
+                style: new Style({
+                    stroke: new Stroke({ color: '#ff00ff', width: 3 }), fill: new Fill({ color: 'rgba(255, 0, 255, 0.2)' }),
+                    image: new CircleStyle({ radius: 7, fill: new Fill({ color: '#ff00ff' }) })
+                })
+            });
+            mapInstanceRef.current.addInteraction(draw);
+            draw.on('drawend', e => {
+                const geom = e.feature.getGeometry();
+                const output = measureMode === 'LineString' ? `Length: ${(getLength(geom, { projection: MAP_PROJECTION }) / 1000).toFixed(2)} km` : `Area: ${(getArea(geom, { projection: MAP_PROJECTION }) / 1000000).toFixed(2)} sq. km`;
+                alert(output);
+                setMeasureMode(null);
+            });
+        }
+    }, [measureMode]);
 
-    if (road.wkt && isVisible) {
-      visibleRoads.push({ ...road, type: 'Normal' });
-    }
-  });
+    const handleTableRowClick = (road) => {
+        setSelectedRoads([road]);
+        const feature = roadLayerRef.current.getSource().getFeatureById(road.gid);
+        if (feature) {
+            mapInstanceRef.current.getView().fit(feature.getGeometry().getExtent(), {
+                padding: [100, 100, 100, 100], duration: 500, maxZoom: 16
+            });
+        }
+    };
+    
+    const handleSnapshot = () => {
+        mapInstanceRef.current.once('rendercomplete', () => {
+            const mapCanvas = document.createElement('canvas');
+            const size = mapInstanceRef.current.getSize();
+            mapCanvas.width = size[0];
+            mapCanvas.height = size[1];
+            const mapContext = mapCanvas.getContext('2d');
+            Array.from(mapInstanceRef.current.getViewport().querySelectorAll('.ol-layer canvas, .ol-layer svg')).forEach(canvas => {
+                if (canvas.width > 0) {
+                    const opacity = canvas.style.opacity || canvas.parentNode.style.opacity;
+                    mapContext.globalAlpha = opacity === '' ? 1 : Number(opacity);
+                    const transform = canvas.style.transform;
+                    if (transform) {
+                        const matrix = transform.match(/^matrix\(([^)]+)\)$/)[1].split(',').map(Number);
+                        mapContext.setTransform.apply(mapContext, matrix);
+                    }
+                    mapContext.drawImage(canvas, 0, 0);
+                    mapContext.setTransform(1, 0, 0, 1, 0, 0);
+                }
+            });
+            const link = document.createElement('a');
+            link.href = mapCanvas.toDataURL();
+            link.download = 'map-snapshot.png';
+            link.click();
+        });
+        mapInstanceRef.current.renderSync();
+    };
 
-  // Multi-Ward Roads
-  if (showMultiWardRoads) {
-    multiWardRoads.forEach((road) => {
-      const matchCondition = conditionFilter.includes(road.condition);
-      if (road.wkt && matchCondition) {
-        visibleRoads.push({ ...road, type: 'Multi-Ward' });
-      }
-    });
-  }
+    const handleExportVisible = () => {
+        const dataToExport = visibleFeatures.roads.map(f => f.getProperties());
+        if (dataToExport.length === 0) { alert("No visible roads to export."); return; }
+        const worksheet = utils.json_to_sheet(dataToExport.map(r => ({ RoadName: r.roadName, Condition: r.condition, Length_m: r.lengthMet?.toFixed(2), Carriage_Type: r.carriageM, Category: r.category })));
+        const workbook = utils.book_new();
+        utils.book_append_sheet(workbook, worksheet, 'Visible Roads');
+        writeFile(workbook, 'visible_roads.xlsx');
+    };
 
-  if (visibleRoads.length === 0) {
-    alert("No roads are currently visible to export.");
-    return;
-  }
+    const handleExportSelected = () => {
+        if (selectedRoads.length === 0) { alert("No roads are selected to export."); return; }
+        const worksheet = utils.json_to_sheet(selectedRoads.map(r => ({ RoadName: r.roadName, Condition: r.condition, Length_m: r.lengthMet?.toFixed(2), Carriage_Type: r.carriageM, Category: r.category })));
+        const workbook = utils.book_new();
+        utils.book_append_sheet(workbook, worksheet, 'Selected Roads');
+        writeFile(workbook, 'selected_roads.xlsx');
+    };
+    
+    const roadsForGraph = useMemo(() => {
+        if (selectedRoads.length > 0) return selectedRoads;
+        return visibleFeatures.roads.map(feature => feature.getProperties());
+    }, [selectedRoads, visibleFeatures]);
 
-  const dataForExcel = visibleRoads.map((road) => ({
-    RoadName: road.roadName,
-    Zone: `${road.zoneNo ?? ''} - ${road.zoneName ?? ''}`,
-    Ward: `${road.wardNo ?? ''} - ${road.wardName ?? ''}`,
-    Condition: road.condition,
-    LengthInMeters: road.lengthMet?.toFixed(2),
-    CarriageType: road.carriageM,
-    Category: road.category,
-    Ownership: road.ownership,
-    Type: road.type,
-    GIS_ID: road.gid
-  }));
-
-  const worksheet = XLSX.utils.json_to_sheet(dataForExcel);
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'Visible Roads');
-  XLSX.writeFile(workbook, 'visible_roads.xlsx');
+    return (
+        <div className="p-4 space-y-4">
+            <h2 className="text-2xl font-bold text-center text-black">All Roads Dashboard</h2>
+            <div className="p-4 bg-gray-50 rounded-lg shadow-sm border space-y-4">
+                <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
+                    <span className="font-semibold text-black">Layer Visibility:</span>
+                    <Checkbox label="Show Wards" checked={showWards} onChange={e => setShowWards(e.target.checked)} />
+                    <Checkbox label="Show Roads" checked={showRoads} onChange={e => setShowRoads(e.target.checked)} />
+                    <Checkbox label="Multi-Ward Roads" checked={showMultiWardRoads} onChange={e => setShowMultiWardRoads(e.target.checked)} />
+                </div>
+                <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
+                    <span className="font-semibold text-black">Road Condition:</span>
+                    <Checkbox label="Good" checked={conditionFilter.includes('Good')} onChange={() => setConditionFilter(p => p.includes('Good') ? p.filter(i => i !== 'Good') : [...p, 'Good'])} />
+                    <Checkbox label="Moderate" checked={conditionFilter.includes('Moderate')} onChange={() => setConditionFilter(p => p.includes('Moderate') ? p.filter(i => i !== 'Moderate') : [...p, 'Moderate'])} />
+                    <Checkbox label="Poor" checked={conditionFilter.includes('Poor')} onChange={() => setConditionFilter(p => p.includes('Poor') ? p.filter(i => i !== 'Poor') : [...p, 'Poor'])} />
+                </div>
+                <div className="flex flex-wrap items-center gap-4">
+                    <select value={baseMapType} onChange={e => setBaseMapType(e.target.value)} className="border rounded p-2 text-sm text-black bg-white">{Object.keys(baseMaps).map(name => <option key={name} value={name}>{name}</option>)}</select>
+                    <select value={selectedCarriage} onChange={e => setSelectedCarriage(e.target.value)} className="border rounded p-2 text-sm text-black bg-white"><option value="">All Carriage Types</option>{carriageTypes.map(type => <option key={type} value={type}>{type}</option>)}</select>
+                    <select value={measureMode || ''} onChange={e => setMeasureMode(e.target.value || null)} className="border rounded p-2 text-sm text-black bg-white"><option value="">Measure Tool</option><option value="LineString">Distance</option><option value="Polygon">Area</option></select>
+                    <button onClick={handleExportVisible} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Export Visible</button>
+                    <button onClick={handleExportSelected} disabled={selectedRoads.length === 0} className="bg-teal-600 text-white px-4 py-2 rounded text-sm hover:bg-teal-700 disabled:bg-gray-400">Export Selected</button>
+                    <button onClick={handleSnapshot} className="bg-green-600 text-white px-4 py-2 rounded text-sm hover:bg-green-700">Snapshot</button>
+                </div>
+            </div>
+            <div ref={mapRef} className="w-full h-[600px] rounded-lg shadow-md border bg-gray-200 relative">
+                 <div ref={popupRef} className="bg-white p-2 rounded-md shadow-lg border border-gray-300"></div>
+                 <div ref={tooltipRef} className="bg-black/60 text-white text-xs p-1 rounded-md pointer-events-none"></div>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div className="lg:col-span-1 bg-white p-4 rounded-lg shadow-sm border"><DataVisualizationPanel graphData={roadsForGraph} /></div>
+                <div className="lg:col-span-2 bg-white p-4 rounded-lg shadow-sm border">
+                    <h3 className="text-lg font-semibold mb-3 text-black">Multi-Ward Roads ({multiWardRoads.length})</h3>
+                    <div className="overflow-auto max-h-96">
+                        <table className="w-full text-sm text-left"><thead className="text-xs text-black uppercase bg-gray-100 sticky top-0"><tr><th className="px-4 py-2">Name</th><th className="px-4 py-2">Condition</th><th className="px-4 py-2">Length (m)</th></tr></thead>
+                            <tbody>{multiWardRoads.map((road) => (<tr key={road.gid} className="bg-white border-b hover:bg-gray-100 cursor-pointer" onClick={() => handleTableRowClick(road)}><td className="px-4 py-2 text-black">{road.roadName}</td><td className="px-4 py-2 text-black">{road.condition}</td><td className="px-4 py-2 text-black">{road.lengthMet?.toFixed(2)}</td></tr>))}</tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
 };
 
-
-
-
-  const toggleCondition = (cond) => {
-    setConditionFilter(prev =>
-      prev.includes(cond) ? prev.filter(c => c !== cond) : [...prev, cond]
+const Checkbox = ({ label, ...props }) => (<label className="flex items-center space-x-2 text-sm text-black"><input type="checkbox" className="accent-blue-600" {...props} /><span>{label}</span></label>);
+const DataVisualizationPanel = ({ graphData }) => {
+    const vizData = useMemo(() => {
+        if(!graphData || graphData.length === 0) return { pieData: [], barData: [] };
+        const conditionCounts = graphData.reduce((acc, road) => { const condition = road.condition || 'N/A'; acc[condition] = (acc[condition] || 0) + 1; return acc; }, {});
+        const lengthByCondition = graphData.reduce((acc, road) => { const condition = road.condition || 'N/A'; acc[condition] = (acc[condition] || 0) + (road.lengthMet || 0); return acc; }, {});
+        const pieData = Object.entries(conditionCounts).map(([name, value]) => ({ name, value }));
+        const barData = Object.entries(lengthByCondition).map(([name, length]) => ({ name, length: parseFloat(length.toFixed(2)) }));
+        return { pieData, barData };
+    }, [graphData]);
+    if (!graphData || graphData.length === 0) return <div className="flex items-center justify-center h-full text-center text-black">No data to display. Apply filters or select roads on the map.</div>;
+    return (
+        <div className="space-y-6">
+            <h3 className="text-xl font-bold text-center text-black">Data Analysis</h3>
+            <div>
+                <h4 className="text-md font-semibold mb-2 text-center text-black">Roads by Condition</h4>
+                <ResponsiveContainer width="100%" height={200}><PieChart><Pie data={vizData.pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} label>{vizData.pieData.map((entry, index) => (<Cell key={`cell-${index}`} fill={colorMap[entry.name] || '#808080'} />))}</Pie><Tooltip /><Legend /></PieChart></ResponsiveContainer>
+            </div>
+            <div>
+                <h4 className="text-md font-semibold mb-2 text-center text-black">Total Length (m) by Condition</h4>
+                <ResponsiveContainer width="100%" height={200}><BarChart data={vizData.barData} margin={{ top: 5, right: 20, left: 20, bottom: 5 }}><XAxis dataKey="name" /><YAxis /><Tooltip /><Bar dataKey="length">{vizData.barData.map((entry, index) => (<Cell key={`cell-${index}`} fill={colorMap[entry.name] || '#808080'} />))}</Bar></BarChart></ResponsiveContainer>
+            </div>
+        </div>
     );
-  };
-
-  return (
-    <div className="p-2 sm:p-4">
-      <h2 className="text-xl sm:text-2xl font-bold text-center mb-3 sm:mb-4 text-slate-800">
-        <span className="hidden sm:inline">All Roads in Ghaziabad Wards</span>
-        <span className="sm:hidden">Roads in Ghaziabad</span>
-      </h2>
-
-      {/* Controls */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:flex lg:flex-wrap text-black gap-2 sm:gap-4 mb-3 sm:mb-4">
-        <label className="flex items-center space-x-2">
-          <input type="checkbox" checked={showWards} onChange={() => setShowWards(!showWards)} />
-          <span className="text-sm sm:text-base">Show Wards</span>
-        </label>
-        <label className="flex items-center space-x-2">
-          <input type="checkbox" checked={showRoads} onChange={() => setShowRoads(!showRoads)} />
-          <span className="text-sm sm:text-base">Show Roads</span>
-        </label>
-        <label className="flex items-center space-x-2">
-          <input type="checkbox" checked={showMultiWardRoads} onChange={() => setShowMultiWardRoads(!showMultiWardRoads)} />
-          <span className="text-sm sm:text-base">Multi-Ward Roads</span>
-        </label>
-        {['Good', 'Moderate', 'Poor'].map(cond => (
-          <label key={cond} className="flex items-center space-x-2">
-            <input type="checkbox" checked={conditionFilter.includes(cond)} onChange={() => toggleCondition(cond)} />
-            <span className="text-sm sm:text-base">{cond}</span>
-          </label>
-        ))}
-        <label className="flex items-center space-x-2">
-          <input type="checkbox" checked={onlySelected} onChange={() => setOnlySelected(!onlySelected)} />
-          <span className="text-sm sm:text-base">Only Selected</span>
-        </label>
-        <select className="border rounded px-2 py-1 text-sm sm:text-base w-full sm:w-auto" onChange={(e) => setMeasureMode(e.target.value || null)}>
-          <option value="">Measure Tool</option>
-          <option value="Point">Point</option>
-          <option value="LineString">Line (Distance)</option>
-          <option value="Polygon">Polygon (Area)</option>
-        </select>
-
-     <button
-  onClick={handleExportToExcel}
-  className="bg-blue-600 text-white px-3 py-1 rounded text-sm sm:text-base hover:bg-blue-700 transition"
->
-  Export Visible Roads
-</button>
-
-
-
-        <select
-  className="border rounded px-2 py-1 text-sm sm:text-base w-full sm:w-auto"
-  value={selectedCarriage}
-  onChange={(e) => setSelectedCarriage(e.target.value)}
->
-  <option value="">All Carriage Types</option>
-  {carriageTypes.map((type, idx) => (
-    <option key={idx} value={type}>
-      {type}
-    </option>
-  ))}
-</select>
-
-      </div>
-
-      {/* Legend */}
-      <div className="mb-2 sm:mb-3 text-xs sm:text-sm text-black">
-        <div className="flex flex-wrap items-center gap-2 sm:gap-4">
-          <span className="flex items-center">
-            <span className="inline-block w-4 h-2 bg-green-500 mr-1"></span>
-            <span>Good</span>
-          </span>
-          <span className="flex items-center">
-            <span className="inline-block w-4 h-2 bg-orange-400 mr-1"></span>
-            <span>Moderate</span>
-          </span>
-          <span className="flex items-center">
-            <span className="inline-block w-4 h-2 bg-red-500 mr-1"></span>
-            <span>Poor</span>
-          </span>
-        </div>
-        <div className="text-xs text-gray-600 mt-1">
-          <span className="hidden sm:inline">(Multi-ward roads have thicker lines)</span>
-          <span className="sm:hidden">(Thicker = Multi-ward)</span>
-        </div>
-      </div>
-
-      {/* Map */}
-      <div className="w-full h-[400px] sm:h-[500px] lg:h-[600px] rounded shadow border bg-gray-100 mb-4 sm:mb-6 relative" ref={mapRef}></div>
-
-      {/* Details */}
-      <div className="space-y-4 lg:space-y-0 lg:flex lg:gap-4">
-        {selectedWard && (
-          <div className="flex-1 bg-white p-3 sm:p-4 shadow border rounded text-black">
-            <h3 className="text-lg sm:text-xl font-semibold mb-2">
-              <span className="hidden sm:inline">Selected Ward: {selectedWard.wardName}</span>
-              <span className="sm:hidden">Ward: {selectedWard.wardName}</span>
-            </h3>
-            <div className="space-y-1 text-sm sm:text-base">
-              <p><strong>Ward No:</strong> {selectedWard.wardNo}</p>
-              <p><strong>Area:</strong> {parseFloat(selectedWard.area).toFixed(2)} m²</p>
-              <p><strong>Extensions:</strong> {selectedWard.wardExten}</p>
-              <p><strong>GIS ID:</strong> {selectedWard.gid}</p>
-            </div>
-          </div>
-        )}
-
-        {selectedRoads.length > 0 && (
-          <div className="flex-1 bg-yellow-100 p-3 sm:p-4 shadow border rounded text-black">
-            <h3 className="text-lg sm:text-xl font-semibold mb-2">
-              <span className="hidden sm:inline">Selected Roads</span>
-              <span className="sm:hidden">Roads ({selectedRoads.length})</span>
-            </h3>
-            <div className="space-y-3 max-h-64 sm:max-h-80 overflow-y-auto">
-              {selectedRoads.map((road) => (
-                <div key={road.gid} className="pb-2 border-b border-yellow-200 last:border-b-0">
-                  <div className="space-y-1 text-sm sm:text-base">
-                    <p><strong>Road:</strong> {road.roadName}</p>
-                    <p><strong>Zone:</strong> {road.zoneNo} - {road.zoneName}</p>
-                    <p><strong>Ward:</strong> {road.wardNo} - {road.wardName}</p>
-                    <p><strong>Condition:</strong> {road.condition}</p>
-                    <p><strong>Length:</strong> {road.lengthMet?.toFixed(2)} m</p>
-                    <p><strong>Type:</strong> {road.carriageM} / {road.category}</p>
-                    <p><strong>Ownership:</strong> {road.ownership}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Multi-Ward Road Table */}
-      <div className="bg-white shadow border rounded p-3 sm:p-4 text-black mt-4 sm:mt-6">
-        <h3 className="text-lg sm:text-xl font-semibold mb-2 sm:mb-3">
-          <span className="hidden sm:inline">Multi-Ward Roads</span>
-          <span className="sm:hidden">Multi-Ward Roads ({multiWardRoads.length})</span>
-        </h3>
-        <div className="overflow-x-auto">
-          <table className="table-auto w-full text-left border-collapse min-w-[600px]">
-            <thead>
-              <tr className="border-b">
-                <th className="px-2 py-2 text-xs sm:text-sm font-medium">Road Name</th>
-                <th className="px-2 py-2 text-xs sm:text-sm font-medium">Wards</th>
-                <th className="px-2 py-2 text-xs sm:text-sm font-medium">Condition</th>
-                <th className="px-2 py-2 text-xs sm:text-sm font-medium">Length (m)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {multiWardRoads.map((road) => (
-                <tr key={road.gid} className="border-b hover:bg-gray-50">
-                  <td className="px-2 py-2 text-xs sm:text-sm">{road.roadName}</td>
-                  <td className="px-2 py-2 text-xs sm:text-sm">{road.wardName}</td>
-                  <td className="px-2 py-2 text-xs sm:text-sm">
-                    <span className={`px-2 py-1 rounded text-xs ${
-                      road.condition === 'Good' ? 'bg-green-100 text-green-800' :
-                      road.condition === 'Moderate' ? 'bg-orange-100 text-orange-800' :
-                      'bg-red-100 text-red-800'
-                    }`}>
-                      {road.condition}
-                    </span>
-                  </td>
-                  <td className="px-2 py-2 text-xs sm:text-sm">{road.lengthMet?.toFixed(2)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  );
 };
 
 export default AllRoadsPage;

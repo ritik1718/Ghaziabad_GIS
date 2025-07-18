@@ -38,7 +38,7 @@ const Navbar = () => {
           <div className="flex items-center space-x-2">
             <MapPin className="w-6 h-6 sm:w-8 sm:h-8 text-emerald-600" />
             {/* Hide MapExplorer text on mobile (screens smaller than sm) */}
-            <span className="hidden sm:block text-xl font-bold text-slate-800">MapExplorer</span>
+            <span className="hidden sm:block text-xl font-bold text-slate-800">Ghaziabad Gis System</span>
           </div>
         </div>
 
